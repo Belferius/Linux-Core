@@ -416,18 +416,23 @@ static int ioctl_mapping(void __user *arg)
 
 static long simplefs_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
-    if (cmd == SIMPLEFS_IOCTL_ZERO_ALL) return obnulit_vse_file();
+    switch (cmd)
+    {
+        case SIMPLEFS_IOCTL_ZERO_ALL:
+            return obnulit_vse_file();
 
-    if (cmd == SIMPLEFS_IOCTL_ERASE_FS) return steret_fs();
+        case SIMPLEFS_IOCTL_ERASE_FS:
+            return steret_fs();
 
-    if (cmd == SIMPLEFS_IOCTL_GET_HASHES) return ioctl_hashes((void __user *)arg);
+        case SIMPLEFS_IOCTL_GET_HASHES:
+            return ioctl_hashes((void __user *)arg);
 
-    if (cmd == SIMPLEFS_IOCTL_GET_MAPPING) return ioctl_mapping((void __user *)arg);
+        case SIMPLEFS_IOCTL_GET_MAPPING:
+            return ioctl_mapping((void __user *)arg);
+    }
 
     return -ENOTTY;
 }
-
-
 
 //         Взаимодействие с VFS
 //  =================================
@@ -518,10 +523,13 @@ static int simplefs_fill_super(struct super_block *sb, void *data, int silent)
     sb->s_op = &simplefs_super_ops;
 
     root_inode = sozdat_inode(sb, S_IFDIR | 0755, 1, NULL);
+    if (!root_inode) return -ENOMEM;
+
     root_inode->i_op = &simplefs_dir_inode_ops;
     root_inode->i_fop = &simplefs_dir_ops;
 
     sb->s_root = d_make_root(root_inode);
+    if (!sb->s_root) return -ENOMEM;
 
     return 0;
 }
@@ -560,9 +568,10 @@ static int __init simplefs_init(void)
         return oshibka;
     }
 
-    sohranit_superblock();
+    if (proverit_superblock(sb1_sektor) || proverit_superblock(sb2_sektor)) sohranit_superblock();
 
-    if (proverit_superblock(sb1_sektor) || proverit_superblock(sb2_sektor)) {
+    if (proverit_superblock(sb1_sektor) || proverit_superblock(sb2_sektor))
+    {
         ochistit_spisok_file();
         zakrit_disk();
         return -EINVAL;
