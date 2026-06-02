@@ -21,16 +21,16 @@ static void help(const char *prog)
     printf("  %s mapping <file> <name>\n", prog);
 }
 
-static int komanda_test(const char *mnt)
+static int command_test(const char *mnt)
 {
     DIR *dir;
     struct dirent *ent;
-    char put[PATH_MAX];
-    char zapis[64];
-    char chtenie[64];
+    char path[PATH_MAX];
+    char write_buf[64];
+    char read_buf[64];
     int fd;
-    int chislo;
-    int kolvo = 0;
+    int number;
+    int count = 0;
 
     dir = opendir(mnt);
     if (!dir) {
@@ -44,29 +44,29 @@ static int komanda_test(const char *mnt)
         if (!strcmp(ent->d_name, ".") || !strcmp(ent->d_name, ".."))
             continue;
 
-        snprintf(put, sizeof(put), "%s/%s", mnt, ent->d_name);
+        snprintf(path, sizeof(path), "%s/%s", mnt, ent->d_name);
 
-        chislo = rand();
-        snprintf(zapis, sizeof(zapis), "%d\n", chislo);
-        memset(chtenie, 0, sizeof(chtenie));
+        number = rand();
+        snprintf(write_buf, sizeof(write_buf), "%d\n", number);
+        memset(read_buf, 0, sizeof(read_buf));
 
-        fd = open(put, O_RDWR);
+        fd = open(path, O_RDWR);
         if (fd < 0) {
-            perror(put);
+            perror(path);
             continue;
         }
 
         lseek(fd, 0, SEEK_SET);
-        write(fd, zapis, strlen(zapis));
+        write(fd, write_buf, strlen(write_buf));
 
         lseek(fd, 0, SEEK_SET);
-        read(fd, chtenie, strlen(zapis));
+        read(fd, read_buf, strlen(write_buf));
 
         close(fd);
 
-        if (strcmp(zapis, chtenie) == 0) {
-            printf("OK %s: %d\n", ent->d_name, chislo);
-            kolvo++;
+        if (strcmp(write_buf, read_buf) == 0) {
+            printf("OK %s: %d\n", ent->d_name, number);
+            count++;
         } else {
             printf("FAIL %s\n", ent->d_name);
         }
@@ -74,14 +74,14 @@ static int komanda_test(const char *mnt)
 
     closedir(dir);
 
-    printf("Checked files: %d\n", kolvo);
+    printf("Checked files: %d\n", count);
 
     return 0;
 }
 
-static int komanda_zero(const char *put)
+static int command_zero(const char *path)
 {
-    int fd = open(put, O_RDWR);
+    int fd = open(path, O_RDWR);
 
     if (fd < 0) {
         perror("open");
@@ -96,9 +96,9 @@ static int komanda_zero(const char *put)
     return 0;
 }
 
-static int komanda_erase(const char *put)
+static int command_erase(const char *path)
 {
-    int fd = open(put, O_RDWR);
+    int fd = open(path, O_RDWR);
 
     if (fd < 0) {
         perror("open");
@@ -113,34 +113,34 @@ static int komanda_erase(const char *put)
     return 0;
 }
 
-static int komanda_hashes(const char *put)
+static int command_hashes(const char *path)
 {
     int fd;
     unsigned int i;
-    unsigned int max_kolvo = 4096;
+    unsigned int max_count = 4096;
     struct simplefs_hashes_user req;
     struct simplefs_hash_info *items;
 
-    fd = open(put, O_RDWR);
+    fd = open(path, O_RDWR);
     if (fd < 0) {
         perror("open");
         return 1;
     }
 
-    items = calloc(max_kolvo, sizeof(struct simplefs_hash_info));
+    items = calloc(max_count, sizeof(struct simplefs_hash_info));
 
     memset(&req, 0, sizeof(req));
-    req.max_kolvo = max_kolvo;
-    req.user_adres = (u64)(uintptr_t)items;
+    req.max_count = max_count;
+    req.user_addr = (u64)(uintptr_t)items;
 
     ioctl(fd, SIMPLEFS_IOCTL_GET_HASHES, &req);
     close(fd);
 
-    for (i = 0; i < req.real_kolvo && i < max_kolvo; i++) {
+    for (i = 0; i < req.real_count && i < max_count; i++) {
         printf("%s: start=%llu size=%u hash=%u\n",
-               items[i].imya,
-               (unsigned long long)items[i].start_sektor,
-               items[i].razmer_v_sektorah,
+               items[i].name,
+               (unsigned long long)items[i].start_sector,
+               items[i].sectors,
                items[i].hash);
     }
 
@@ -149,28 +149,28 @@ static int komanda_hashes(const char *put)
     return 0;
 }
 
-static int komanda_mapping(const char *put, const char *imya)
+static int command_mapping(const char *path, const char *name)
 {
     int fd;
     struct simplefs_mapping_user req;
 
-    fd = open(put, O_RDWR);
+    fd = open(path, O_RDWR);
     if (fd < 0) {
         perror("open");
         return 1;
     }
 
     memset(&req, 0, sizeof(req));
-    snprintf(req.imya, SIMPLEFS_MAX_NAME, "%s", imya);
+    snprintf(req.name, SIMPLEFS_MAX_NAME, "%s", name);
 
     ioctl(fd, SIMPLEFS_IOCTL_GET_MAPPING, &req);
 
     close(fd);
 
     printf("%s: start=%llu size=%u sectors\n",
-           req.imya,
-           (unsigned long long)req.start_sektor,
-           req.razmer_v_sektorah);
+           req.name,
+           (unsigned long long)req.start_sector,
+           req.sectors);
 
     return 0;
 }
@@ -183,19 +183,19 @@ int main(int argc, char **argv)
     }
 
     if (!strcmp(argv[1], "test"))
-        return komanda_test(argv[2]);
+        return command_test(argv[2]);
 
     if (!strcmp(argv[1], "zero"))
-        return komanda_zero(argv[2]);
+        return command_zero(argv[2]);
 
     if (!strcmp(argv[1], "erase"))
-        return komanda_erase(argv[2]);
+        return command_erase(argv[2]);
 
     if (!strcmp(argv[1], "hashes"))
-        return komanda_hashes(argv[2]);
+        return command_hashes(argv[2]);
 
     if (!strcmp(argv[1], "mapping") && argc == 4)
-        return komanda_mapping(argv[2], argv[3]);
+        return command_mapping(argv[2], argv[3]);
 
     help(argv[0]);
 

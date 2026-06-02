@@ -18,46 +18,46 @@
 #define SIMPLEFS_MAGIC 0x53465331
 #define SIMPLEFS_SECTOR_SIZE 512
 
-static char *imya_diska = "/dev/loop0";
-static unsigned long sb1_sektor = 0;
-static unsigned long sb2_sektor = 101;
-static unsigned int max_dlina_imeni = 32;
-static unsigned int max_sektorov_file = 4;
+static char *disk_name = "/dev/loop0";
+static unsigned long sb_first_sector = 0;
+static unsigned long sb_second_sector = 101;
+static unsigned int max_name_len = 32;
+static unsigned int max_file_sectors = 4;
 
-module_param(imya_diska, charp, 0444);
-module_param(sb1_sektor, ulong, 0444);
-module_param(sb2_sektor, ulong, 0444);
-module_param(max_dlina_imeni, uint, 0444);
-module_param(max_sektorov_file, uint, 0444);
+module_param(disk_name, charp, 0444);
+module_param(sb_first_sector, ulong, 0444);
+module_param(sb_second_sector, ulong, 0444);
+module_param(max_name_len, uint, 0444);
+module_param(max_file_sectors, uint, 0444);
 
 struct simplefs_superblock
 {
     u32 magic;
-    u32 razmer_sektora;
-    u64 sb1_sektor;
-    u64 sb2_sektor;
-    u32 max_dlina_imeni;
-    u32 max_sektorov_file;
-    u32 kolvo_file;
+    u32 sector_size;
+    u64 sb_first_sector;
+    u64 sb_second_sector;
+    u32 max_name_len;
+    u32 max_file_sectors;
+    u32 file_count;
     u32 hash;
 };
 
 struct simplefs_file
 {
-    char imya[SIMPLEFS_MAX_NAME];
-    u64 start_sektor;
-    u32 razmer_v_sektorah;
+    char name[SIMPLEFS_MAX_NAME];
+    u64 start_sector;
+    u32 sectors;
 };
 
-static struct file *file_diska;
-static struct simplefs_file *spisok_file;
-static unsigned int kolvo_file;
-static u64 kolvo_sektorov_diska;
+static struct file *disk_file;
+static struct simplefs_file *file_list;
+static unsigned int file_count;
+static u64 disk_sectors;
 
 //               Хэш
 //  ===============================
 
-static u32 hash_dobavit(u32 h, const void *data, size_t len)
+static u32 hash_update(u32 h, const void *data, size_t len)
 {
     const u8 *p = data;
     size_t i;
@@ -70,17 +70,17 @@ static u32 hash_dobavit(u32 h, const void *data, size_t len)
     return h;
 }
 
-static u32 schitat_hash(const void *data, size_t len)
+static u32 calc_hash(const void *data, size_t len)
 {
-    return hash_dobavit(2166136261u, data, len);
+    return hash_update(2166136261u, data, len);
 }
 
-static u32 schitat_hash_sb(struct simplefs_superblock *sb)
+static u32 calc_superblock_hash(struct simplefs_superblock *sb)
 {
     struct simplefs_superblock tmp = *sb;
 
     tmp.hash = 0;
-    return schitat_hash(&tmp, sizeof(tmp));
+    return calc_hash(&tmp, sizeof(tmp));
 }
 
 
@@ -88,67 +88,95 @@ static u32 schitat_hash_sb(struct simplefs_superblock *sb)
 //          Диск и секторы
 //  ================================
 
-static int otkrit_disk(void)
+static int open_disk(void)
 {
-    file_diska = bdev_file_open_by_path(imya_diska,BLK_OPEN_READ | BLK_OPEN_WRITE, NULL, NULL);
+    disk_file = bdev_file_open_by_path(disk_name,BLK_OPEN_READ | BLK_OPEN_WRITE, NULL, NULL);
 
-    if (IS_ERR(file_diska)) return PTR_ERR(file_diska);
+    if (IS_ERR(disk_file)) return PTR_ERR(disk_file);
 
-    pr_info("SimpleFS: disk otkrit: %s\n", imya_diska);
+    pr_info("SimpleFS: disk otkrit: %s\n", disk_name);
 
     return 0;
 }
 
-static void zakrit_disk(void)
+static void close_disk(void)
 {
-    if (file_diska && !IS_ERR(file_diska)) fput(file_diska);
+    if (disk_file && !IS_ERR(disk_file)) fput(disk_file);
 }
 
-static int pisat_v_sektor(u64 sektor, void *buf, size_t len)
+static int write_sector(u64 sektor, void *buf, size_t len)
 {
     loff_t pos = sektor * SIMPLEFS_SECTOR_SIZE;
 
-    if (kernel_write(file_diska, buf, len, &pos) != len) return -EIO;
+    if (kernel_write(disk_file, buf, len, &pos) != len) return -EIO;
 
     return 0;
 }
 
-static int chitat_iz_sektora(u64 sektor, void *buf, size_t len)
+static int read_sector(u64 sektor, void *buf, size_t len)
 {
     loff_t pos = sektor * SIMPLEFS_SECTOR_SIZE;
 
-    if (kernel_read(file_diska, buf, len, &pos) != len) return -EIO;
+    if (kernel_read(disk_file, buf, len, &pos) != len) return -EIO;
 
     return 0;
+}
+
+
+static int sector_is_empty(u64 sektor)
+{
+    char *buf;
+    int i;
+
+    buf = kzalloc(SIMPLEFS_SECTOR_SIZE, GFP_KERNEL);
+    if (!buf) return 0;
+
+    if (read_sector(sektor, buf, SIMPLEFS_SECTOR_SIZE))
+    {
+        kfree(buf);
+        return 0;
+    }
+
+    for (i = 0; i < SIMPLEFS_SECTOR_SIZE; i++)
+    {
+        if (buf[i] != 0)
+        {
+            kfree(buf);
+            return 0;
+        }
+    }
+
+    kfree(buf);
+    return 1;
 }
 
 
 //     Суперблоки и обычные файлы
 //  ================================
 
-static int mesto_pod_file_svobodno(u64 start)
+static int file_place_is_free(u64 start)
 {
     u32 i;
-    for (i = 0; i < max_sektorov_file; i++)
+    for (i = 0; i < max_file_sectors; i++)
     {
-        if ((start + i) == sb1_sektor || (start + i)  == sb2_sektor) return 0;
+        if ((start + i) == sb_first_sector || (start + i)  == sb_second_sector) return 0;
     }
     return 1;
 }
 
-static int sozdat_spisok_file(void)
+static int build_file_list(void)
 {
     u64 sektor = 0;
     unsigned int i = 0;
 
-    kolvo_sektorov_diska = bdev_nr_bytes(file_bdev(file_diska)) / SIMPLEFS_SECTOR_SIZE; // Узнаём кол-во секторов, разделив доступное кол-во байт на размер сектора
+    disk_sectors = bdev_nr_bytes(file_bdev(disk_file)) / SIMPLEFS_SECTOR_SIZE; // Узнаём кол-во секторов, разделив доступное кол-во байт на размер сектора
 
-    while (sektor + max_sektorov_file <= kolvo_sektorov_diska)
+    while (sektor + max_file_sectors <= disk_sectors)
     {
-        if (mesto_pod_file_svobodno(sektor))
+        if (file_place_is_free(sektor))
         {
-            kolvo_file++;
-            sektor += max_sektorov_file;
+            file_count++;
+            sektor += max_file_sectors;
         }
         else
         {
@@ -156,44 +184,44 @@ static int sozdat_spisok_file(void)
         }
     }
 
-    spisok_file = kcalloc(kolvo_file, sizeof(struct simplefs_file), GFP_KERNEL);
-    if (!spisok_file) return -ENOMEM;
+    file_list = kcalloc(file_count, sizeof(struct simplefs_file), GFP_KERNEL);
+    if (!file_list) return -ENOMEM;
 
     sektor = 0;
 
-    while (i < kolvo_file && sektor + max_sektorov_file <= kolvo_sektorov_diska)
+    while (i < file_count && sektor + max_file_sectors <= disk_sectors)
     {
-        if (!mesto_pod_file_svobodno(sektor))
+        if (!file_place_is_free(sektor))
         {
             sektor++;
             continue;
         }
 
-        snprintf(spisok_file[i].imya, SIMPLEFS_MAX_NAME, "file%u", i);
-        spisok_file[i].start_sektor = sektor;
-        spisok_file[i].razmer_v_sektorah = max_sektorov_file;
+        snprintf(file_list[i].name, SIMPLEFS_MAX_NAME, "file%u", i);
+        file_list[i].start_sector = sektor;
+        file_list[i].sectors = max_file_sectors;
 
         i++;
-        sektor += max_sektorov_file;
+        sektor += max_file_sectors;
     }
 
-    pr_info("SimpleFS: sektorov=%llu, file=%u\n", kolvo_sektorov_diska, kolvo_file);
+    pr_info("SimpleFS: sektorov=%llu, file=%u\n", disk_sectors, file_count);
 
     return 0;
 }
 
-static void ochistit_spisok_file(void)
+static void free_file_list(void)
 {
-    kfree(spisok_file);
+    kfree(file_list);
 }
 
-static int naiti_file_po_imeni(const char *imya, int dlina)
+static int find_file_by_name(const char *name, int len)
 {
     unsigned int i;
 
-    for (i = 0; i < kolvo_file; i++)
+    for (i = 0; i < file_count; i++)
     {
-        if (strlen(spisok_file[i].imya) == dlina && memcmp(spisok_file[i].imya, imya, dlina) == 0) return i;
+        if (strlen(file_list[i].name) == len && memcmp(file_list[i].name, name, len) == 0) return i;
     }
 
     return -1;
@@ -202,39 +230,39 @@ static int naiti_file_po_imeni(const char *imya, int dlina)
 //    Взаимодействие с суперблоками
 //  =================================
 
-static int sohranit_superblock(void)
+static int save_superblock(void)
 {
     struct simplefs_superblock sb;
 
     memset(&sb, 0, sizeof(sb));
 
     sb.magic = SIMPLEFS_MAGIC;
-    sb.razmer_sektora = SIMPLEFS_SECTOR_SIZE;
-    sb.sb1_sektor = sb1_sektor;
-    sb.sb2_sektor = sb2_sektor;
-    sb.max_dlina_imeni = max_dlina_imeni;
-    sb.max_sektorov_file = max_sektorov_file;
-    sb.kolvo_file = kolvo_file;
-    sb.hash = schitat_hash_sb(&sb);
+    sb.sector_size = SIMPLEFS_SECTOR_SIZE;
+    sb.sb_first_sector = sb_first_sector;
+    sb.sb_second_sector = sb_second_sector;
+    sb.max_name_len = max_name_len;
+    sb.max_file_sectors = max_file_sectors;
+    sb.file_count = file_count;
+    sb.hash = calc_superblock_hash(&sb);
 
-    pisat_v_sektor(sb1_sektor, &sb, sizeof(sb));
-    pisat_v_sektor(sb2_sektor, &sb, sizeof(sb));
+    write_sector(sb_first_sector, &sb, sizeof(sb));
+    write_sector(sb_second_sector, &sb, sizeof(sb));
 
     pr_info("SimpleFS: superblock zapisan, hash=%u\n", sb.hash);
 
     return 0;
 }
 
-static int proverit_superblock(u64 sektor)
+static int check_superblock(u64 sektor)
 {
     struct simplefs_superblock sb;
 
     memset(&sb, 0, sizeof(sb));
-    chitat_iz_sektora(sektor, &sb, sizeof(sb));
+    read_sector(sektor, &sb, sizeof(sb));
 
     if (sb.magic != SIMPLEFS_MAGIC) return -EINVAL;
 
-    if (sb.hash != schitat_hash_sb(&sb)) return -EINVAL;
+    if (sb.hash != calc_superblock_hash(&sb)) return -EINVAL;
 
     return 0;
 }
@@ -247,20 +275,20 @@ static ssize_t simplefs_read(struct file *file, char __user *buf, size_t len, lo
     struct simplefs_file *info = file_inode(file)->i_private;
     char *tmp;
     loff_t pos;
-    size_t razmer_file;
+    size_t file_size;
 
-    razmer_file = info->razmer_v_sektorah * SIMPLEFS_SECTOR_SIZE;
+    file_size = info->sectors * SIMPLEFS_SECTOR_SIZE;
 
-    if (*ppos >= razmer_file) return 0;
+    if (*ppos >= file_size) return 0;
 
-    if (len > razmer_file - *ppos) len = razmer_file - *ppos;
+    if (len > file_size - *ppos) len = file_size - *ppos;
 
     tmp = kzalloc(len, GFP_KERNEL);
     if (!tmp) return -ENOMEM;
 
-    pos = info->start_sektor * SIMPLEFS_SECTOR_SIZE + *ppos;
+    pos = info->start_sector * SIMPLEFS_SECTOR_SIZE + *ppos;
 
-    kernel_read(file_diska, tmp, len, &pos);
+    kernel_read(disk_file, tmp, len, &pos);
     copy_to_user(buf, tmp, len);
 
     *ppos += len;
@@ -275,22 +303,22 @@ static ssize_t simplefs_write(struct file *file, const char __user *buf, size_t 
     struct simplefs_file *info = file_inode(file)->i_private;
     char *tmp;
     loff_t pos;
-    size_t razmer_file;
+    size_t file_size;
 
-    razmer_file = info->razmer_v_sektorah * SIMPLEFS_SECTOR_SIZE;
+    file_size = info->sectors * SIMPLEFS_SECTOR_SIZE;
 
-    if (*ppos >= razmer_file) return -ENOSPC;
+    if (*ppos >= file_size) return -ENOSPC;
 
-    if (len > razmer_file - *ppos) len = razmer_file - *ppos;
+    if (len > file_size - *ppos) len = file_size - *ppos;
 
     tmp = kzalloc(len, GFP_KERNEL);
     if (!tmp) return -ENOMEM;
 
     copy_from_user(tmp, buf, len);
 
-    pos = info->start_sektor * SIMPLEFS_SECTOR_SIZE + *ppos;
+    pos = info->start_sector * SIMPLEFS_SECTOR_SIZE + *ppos;
 
-    kernel_write(file_diska, tmp, len, &pos);
+    kernel_write(disk_file, tmp, len, &pos);
 
     *ppos += len;
 
@@ -304,7 +332,7 @@ static ssize_t simplefs_write(struct file *file, const char __user *buf, size_t 
 //                IOCTL
 //  ================================
 
-static int obnulit_vse_file(void)
+static int zero_all_files(void)
 {
     char *zero;
     unsigned int i;
@@ -313,34 +341,34 @@ static int obnulit_vse_file(void)
     zero = kzalloc(SIMPLEFS_SECTOR_SIZE, GFP_KERNEL);
     if (!zero) return -ENOMEM;
 
-    for (i = 0; i < kolvo_file; i++)
+    for (i = 0; i < file_count; i++)
     {
-        for (j = 0; j < spisok_file[i].razmer_v_sektorah; j++)
-            pisat_v_sektor(spisok_file[i].start_sektor + j, zero, SIMPLEFS_SECTOR_SIZE);
+        for (j = 0; j < file_list[i].sectors; j++)
+            write_sector(file_list[i].start_sector + j, zero, SIMPLEFS_SECTOR_SIZE);
     }
 
     kfree(zero);
     return 0;
 }
 
-static int steret_fs(void)
+static int erase_fs(void)
 {
     char *zero;
 
-    obnulit_vse_file();
+    zero_all_files();
 
     zero = kzalloc(SIMPLEFS_SECTOR_SIZE, GFP_KERNEL);
     if (!zero) return -ENOMEM;
 
-    pisat_v_sektor(sb1_sektor, zero, SIMPLEFS_SECTOR_SIZE);
-    pisat_v_sektor(sb2_sektor, zero, SIMPLEFS_SECTOR_SIZE);
+    write_sector(sb_first_sector, zero, SIMPLEFS_SECTOR_SIZE);
+    write_sector(sb_second_sector, zero, SIMPLEFS_SECTOR_SIZE);
 
     kfree(zero);
 
     return 0;
 }
 
-static int poschitat_hash_file(unsigned int nomer, u32 *hash)
+static int calc_file_hash(unsigned int number, u32 *hash)
 {
     char *buf;
     u32 j;
@@ -349,10 +377,10 @@ static int poschitat_hash_file(unsigned int nomer, u32 *hash)
     buf = kzalloc(SIMPLEFS_SECTOR_SIZE, GFP_KERNEL);
     if (!buf) return -ENOMEM;
 
-    for (j = 0; j < spisok_file[nomer].razmer_v_sektorah; j++)
+    for (j = 0; j < file_list[number].sectors; j++)
     {
-        chitat_iz_sektora(spisok_file[nomer].start_sektor + j, buf, SIMPLEFS_SECTOR_SIZE);
-        h = hash_dobavit(h, buf, SIMPLEFS_SECTOR_SIZE);
+        read_sector(file_list[number].start_sector + j, buf, SIMPLEFS_SECTOR_SIZE);
+        h = hash_update(h, buf, SIMPLEFS_SECTOR_SIZE);
     }
 
     kfree(buf);
@@ -371,21 +399,21 @@ static int ioctl_hashes(void __user *arg)
 
     copy_from_user(&req, arg, sizeof(req));
 
-    req.real_kolvo = kolvo_file;
-    n = req.max_kolvo;
+    req.real_count = file_count;
+    n = req.max_count;
 
-    if (n > kolvo_file) n = kolvo_file;
+    if (n > file_count) n = file_count;
 
-    user_items = (char __user *)(unsigned long)req.user_adres;
+    user_items = (char __user *)(unsigned long)req.user_addr;
 
     for (i = 0; i < n; i++)
     {
         memset(&info, 0, sizeof(info));
 
-        strscpy(info.imya, spisok_file[i].imya, SIMPLEFS_MAX_NAME);
-        info.start_sektor = spisok_file[i].start_sektor;
-        info.razmer_v_sektorah = spisok_file[i].razmer_v_sektorah;
-        poschitat_hash_file(i, &info.hash);
+        strscpy(info.name, file_list[i].name, SIMPLEFS_MAX_NAME);
+        info.start_sector = file_list[i].start_sector;
+        info.sectors = file_list[i].sectors;
+        calc_file_hash(i, &info.hash);
 
         copy_to_user(user_items + i * sizeof(info), &info, sizeof(info));
     }
@@ -397,17 +425,17 @@ static int ioctl_hashes(void __user *arg)
 static int ioctl_mapping(void __user *arg)
 {
     struct simplefs_mapping_user req;
-    int nomer;
+    int number;
 
     copy_from_user(&req, arg, sizeof(req));
 
-    req.imya[SIMPLEFS_MAX_NAME - 1] = '\0';
+    req.name[SIMPLEFS_MAX_NAME - 1] = '\0';
 
-    nomer = naiti_file_po_imeni(req.imya, strnlen(req.imya, SIMPLEFS_MAX_NAME));
-    if (nomer < 0) return -ENOENT;
+    number = find_file_by_name(req.name, strnlen(req.name, SIMPLEFS_MAX_NAME));
+    if (number < 0) return -ENOENT;
 
-    req.start_sektor = spisok_file[nomer].start_sektor;
-    req.razmer_v_sektorah = spisok_file[nomer].razmer_v_sektorah;
+    req.start_sector = file_list[number].start_sector;
+    req.sectors = file_list[number].sectors;
 
     copy_to_user(arg, &req, sizeof(req));
 
@@ -419,10 +447,10 @@ static long simplefs_ioctl(struct file *file, unsigned int cmd, unsigned long ar
     switch (cmd)
     {
         case SIMPLEFS_IOCTL_ZERO_ALL:
-            return obnulit_vse_file();
+            return zero_all_files();
 
         case SIMPLEFS_IOCTL_ERASE_FS:
-            return steret_fs();
+            return erase_fs();
 
         case SIMPLEFS_IOCTL_GET_HASHES:
             return ioctl_hashes((void __user *)arg);
@@ -433,6 +461,8 @@ static long simplefs_ioctl(struct file *file, unsigned int cmd, unsigned long ar
 
     return -ENOTTY;
 }
+
+
 
 //         Взаимодействие с VFS
 //  =================================
@@ -445,7 +475,7 @@ static const struct file_operations simplefs_file_ops = {
     .llseek = default_llseek,
 };
 
-static struct inode *sozdat_inode(struct super_block *sb, umode_t mode, unsigned long nomer_inode, struct simplefs_file *file_info)
+static struct inode *create_inode(struct super_block *sb, umode_t mode, unsigned long nomer_inode, struct simplefs_file *file_info)
 {
     struct inode *inode;
 
@@ -463,7 +493,7 @@ static struct inode *sozdat_inode(struct super_block *sb, umode_t mode, unsigned
     }
     else
     {
-        inode->i_size = max_sektorov_file * SIMPLEFS_SECTOR_SIZE;
+        inode->i_size = max_file_sectors * SIMPLEFS_SECTOR_SIZE;
         set_nlink(inode, 1);
         inode->i_fop = &simplefs_file_ops;
     }
@@ -477,9 +507,9 @@ static int simplefs_readdir(struct file *file, struct dir_context *ctx)
 
     if (ctx->pos < 2 && !dir_emit_dots(file, ctx)) return 0;
 
-    for (i = ctx->pos - 2; i < kolvo_file; i++)
+    for (i = ctx->pos - 2; i < file_count; i++)
     {
-        if (!dir_emit(ctx, spisok_file[i].imya, strlen(spisok_file[i].imya), i + 2, DT_REG)) return 0;
+        if (!dir_emit(ctx, file_list[i].name, strlen(file_list[i].name), i + 2, DT_REG)) return 0;
 
         ctx->pos++;
     }
@@ -489,12 +519,12 @@ static int simplefs_readdir(struct file *file, struct dir_context *ctx)
 
 static struct dentry *simplefs_lookup(struct inode *dir, struct dentry *dentry, unsigned int flags)
 {
-    int nomer;
+    int number;
     struct inode *inode = NULL;
 
-    nomer = naiti_file_po_imeni(dentry->d_name.name, dentry->d_name.len);
+    number = find_file_by_name(dentry->d_name.name, dentry->d_name.len);
 
-    if (nomer >= 0) inode = sozdat_inode(dir->i_sb, S_IFREG | 0666, nomer + 2, &spisok_file[nomer]);
+    if (number >= 0) inode = create_inode(dir->i_sb, S_IFREG | 0666, number + 2, &file_list[number]);
 
     d_add(dentry, inode);
 
@@ -522,7 +552,13 @@ static int simplefs_fill_super(struct super_block *sb, void *data, int silent)
     sb->s_magic = SIMPLEFS_MAGIC;
     sb->s_op = &simplefs_super_ops;
 
-    root_inode = sozdat_inode(sb, S_IFDIR | 0755, 1, NULL);
+    if (check_superblock(sb_first_sector) || check_superblock(sb_second_sector))
+    {
+        pr_err("SimpleFS: superblock povrezhden, mount zapreshen\n");
+        return -EINVAL;
+    }
+
+    root_inode = create_inode(sb, S_IFDIR | 0755, 1, NULL);
     if (!root_inode) return -ENOMEM;
 
     root_inode->i_op = &simplefs_dir_inode_ops;
@@ -553,35 +589,29 @@ static struct file_system_type simplefs_type = {
 
 static int __init simplefs_init(void)
 {
-    int oshibka;
+    int error;
 
     pr_info("SimpleFS: module loaded\n");
 
-    if (max_sektorov_file == 0 || sb1_sektor == sb2_sektor) return -EINVAL;
+    if (max_file_sectors == 0 || sb_first_sector == sb_second_sector) return -EINVAL;
 
-    oshibka = otkrit_disk();
-    if (oshibka) return oshibka;
+    error = open_disk();
+    if (error) return error;
 
-    oshibka = sozdat_spisok_file();
-    if (oshibka) {
-        zakrit_disk();
-        return oshibka;
+    error = build_file_list();
+    if (error) {
+        close_disk();
+        return error;
     }
 
-    if (proverit_superblock(sb1_sektor) || proverit_superblock(sb2_sektor)) sohranit_superblock();
+    if (sector_is_empty(sb_first_sector) && sector_is_empty(sb_second_sector))
+        save_superblock();
 
-    if (proverit_superblock(sb1_sektor) || proverit_superblock(sb2_sektor))
-    {
-        ochistit_spisok_file();
-        zakrit_disk();
-        return -EINVAL;
-    }
-
-    oshibka = register_filesystem(&simplefs_type);
-    if (oshibka) {
-        ochistit_spisok_file();
-        zakrit_disk();
-        return oshibka;
+    error = register_filesystem(&simplefs_type);
+    if (error) {
+        free_file_list();
+        close_disk();
+        return error;
     }
 
     pr_info("SimpleFS: filesystem registered\n");
@@ -592,8 +622,8 @@ static int __init simplefs_init(void)
 static void __exit simplefs_exit(void)
 {
     unregister_filesystem(&simplefs_type);
-    ochistit_spisok_file();
-    zakrit_disk();
+    free_file_list();
+    close_disk();
 
     pr_info("SimpleFS: module unloaded\n");
 }

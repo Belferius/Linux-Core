@@ -15,22 +15,22 @@ typedef uint64_t u64;
 #define SIMPLEFS_IOCTL_MAGIC 's'
 
 struct simplefs_hash_info {
-    char imya[SIMPLEFS_MAX_NAME];
-    u64 start_sektor;
-    u32 razmer_v_sektorah;
+    char name[SIMPLEFS_MAX_NAME];
+    u64 start_sector;
+    u32 sectors;
     u32 hash;
 };
 
 struct simplefs_hashes_user {
-    u32 max_kolvo;
-    u32 real_kolvo;
-    u64 user_adres;
+    u32 max_count;
+    u32 real_count;
+    u64 user_addr;
 };
 
 struct simplefs_mapping_user {
-    char imya[SIMPLEFS_MAX_NAME];
-    u64 start_sektor;
-    u32 razmer_v_sektorah;
+    char name[SIMPLEFS_MAX_NAME];
+    u64 start_sector;
+    u32 sectors;
 };
 
 #define SIMPLEFS_IOCTL_ZERO_ALL    _IO(SIMPLEFS_IOCTL_MAGIC, 1)
